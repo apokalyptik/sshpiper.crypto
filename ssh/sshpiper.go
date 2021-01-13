@@ -6,9 +6,19 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+)
+
+type contextKey string
+
+const (
+	SSHPiperContextDownstreamUsername contextKey = "DownstreamUsername"
+	SSHPiperContextDownstreamAddress  contextKey = "DownstreamAddress"
+	SSHPiperContextUpstreamUsername   contextKey = "UpstreamUsername"
+	SSHPiperContextUpstreamAddress    contextKey = "UpstreamAddress"
 )
 
 // AuthPipeType declares how sshpiper handle piped auth message
@@ -189,9 +199,21 @@ func (s *PiperConfig) AddHostKey(key Signer) {
 // It handshake with downstream ssh client and upstream ssh server provicde by FindUpstream.
 // If either handshake is unsuccessful, the whole piped connection will be closed.
 func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err error) {
+	p, _, err := NewSSHPiperConnWithContext(conn, piper, context.Background())
+	return p, err
+}
+
+// NewSSHPiperConnWithContext starts a piped ssh connection witch conn as its downstream transport.
+// It handshake with downstream ssh client and upstream ssh server provicde by FindUpstream. If
+// either handshake is unsuccessful, the whole piped connection will be closed. Additionally
+// NewSSHPiperConnWithContext requires and returns a context.Context so that metadata can be
+// associated with the connection (for logging or auditing purposes, for example)
+func NewSSHPiperConnWithContext(conn net.Conn, piper *PiperConfig, c context.Context) (pipe *PiperConn, ctx context.Context, err error) {
+
+	ctx = c
 
 	if piper.FindUpstream == nil {
-		return nil, errors.New("sshpiper: must specify FindUpstream")
+		return nil, ctx, errors.New("sshpiper: must specify FindUpstream")
 	}
 
 	d, err := newDownstream(conn, &ServerConfig{
@@ -200,7 +222,7 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 		ServerVersion: piper.ServerVersion,
 	})
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 	defer func() {
 		if pipe == nil {
@@ -210,9 +232,10 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 
 	userAuthReq, err := d.nextAuthMsg()
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
+	ctx = context.WithValue(ctx, SSHPiperContextDownstreamUsername, userAuthReq.User)
 	d.user = userAuthReq.User
 
 	if piper.BannerCallback != nil {
@@ -222,7 +245,7 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 				Message: msg,
 			}
 			if err := d.transport.writePacket(Marshal(bannerMsg)); err != nil {
-				return nil, err
+				return nil, ctx, err
 			}
 		}
 	}
@@ -238,13 +261,13 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 			}))
 
 			if err != nil {
-				return nil, err
+				return nil, ctx, err
 			}
 
 			userAuthReq, err := d.nextAuthMsg()
 
 			if err != nil {
-				return nil, err
+				return nil, ctx, err
 			}
 
 			if userAuthReq.Method == "keyboard-interactive" {
@@ -256,21 +279,23 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 		challengeCtx, err = piper.AdditionalChallenge(d, prompter.Challenge)
 
 		if err != nil {
-			return nil, err
+			return nil, ctx, err
 		}
 	}
 
 	upconn, pipeauth, err := piper.FindUpstream(d, challengeCtx)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
 	if pipeauth.UpstreamHostKeyCallback == nil {
-		return nil, errors.New("sshpiper: must specify UpstreamHostKeyCallback")
+		return nil, ctx, errors.New("sshpiper: must specify UpstreamHostKeyCallback")
 	}
 
 	mappedUser := pipeauth.User
 	addr := upconn.RemoteAddr().String()
+	ctx = context.WithValue(ctx, SSHPiperContextUpstreamUsername, pipeauth.User)
+	ctx = context.WithValue(ctx, SSHPiperContextUpstreamAddress, addr)
 
 	if mappedUser == "" {
 		mappedUser = d.user
@@ -280,7 +305,7 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 		HostKeyCallback: pipeauth.UpstreamHostKeyCallback,
 	})
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 	defer func() {
 		if pipe == nil {
@@ -448,10 +473,10 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 
 	err = p.pipeAuth(userAuthReq)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
 
-	return &PiperConn{pipedConn: p}, nil
+	return &PiperConn{pipedConn: p}, ctx, nil
 }
 
 func (pipe *pipedConn) ack(key PublicKey) error {
